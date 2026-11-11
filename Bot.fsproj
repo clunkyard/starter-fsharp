@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AssemblyName>bot</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Bot.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="Clunkyard">
+      <HintPath>$(ClunkyardSdk)/bindings/csharp/Clunkyard.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
