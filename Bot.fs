@@ -44,19 +44,6 @@ module Bot
 open System
 open Clunkyard
 let n (value:double)=Nullable value
-// The calibration kernel, xorshift-sqrt v1: work rounds of a 64-bit
-// xorshift and a square-root sum.
-let calibrationWork (work: int64) (tick: uint64) =
-    let mutable x = 88172645463325252UL ^^^ tick
-    let mutable sum = 0.0
-    for _ in 1L .. work do
-        x <- x ^^^ (x <<< 13)
-        x <- x ^^^ (x >>> 7)
-        x <- x ^^^ (x <<< 17)
-        sum <- sum + sqrt (float (x >>> 11))
-    (uint64 (floor sum) + (x >>> 40)) % 1000000UL
-
-
 type Starter() =
     inherit Robot()
     let mutable free=false
@@ -101,10 +88,6 @@ type Starter() =
         if not(isNull zone) && zone.Margin(position).GetValueOrDefault(1e9)<60.0 then
             let climb=if zone.Shape=Shape.Sphere then this.Angles.ElevationTo(position,zone.Center) else 0.0
             this.Drive.Set(n 0.8,n(this.Angles.Clamp(this.Angles.AngleDiff(this.Angles.BearingTo(position,zone.Center),self.Heading)/30.0)),n(this.Angles.Clamp((climb-self.Pitch)/30.0)))
-        // The arena's rate calibration only; safe to delete.
-        let work=int64(this.Raw.Number("state.calibration.work").GetValueOrDefault(0.0))
-        if work>0L then this.Status.Set("WORK",n(float(calibrationWork work (uint64 this.Clock.Tick))))
-
 [<EntryPoint>]
 let main _ =
     Clunkyard.Clunkyard.Run(Starter())
