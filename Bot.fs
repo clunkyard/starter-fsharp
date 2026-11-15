@@ -1,4 +1,9 @@
 // A robot on the arena's shared .NET core binding.
+// Bearing is earned: a scan contact's bearing is off by up to its
+// BearingError (degrees, a fixed share of the arc), so a wide beam finds a
+// robot and a narrow one aims at it. The robot narrows the beam, holds it
+// on the target and aims along a line fitted through its recent sightings.
+// Contacts within 120 units are exact.
 // Clunkyard robot API 2.0.0: one core under every language, the same
 // answers everywhere. Facts (a call shows its arguments):
 // match: mode ruleset control robots is_3d tick_rate max_ticks
@@ -46,35 +51,84 @@ module Bot
 open System
 open Clunkyard
 let n (value:double)=Nullable value
+let searchArc=40.0  // degrees: sweeps the circle in half a second
+let holdWidth=60.0  // units across at the target: it stays in the beam from tick to tick
+let minArc=6.0      // degrees: the narrowest the beam holds
+let window=12       // ticks of sightings the aim averages
+let sightings=8     // narrow sightings in the window before a shot
+let lookEvery=40    // ticks between looks around the target, for a nearer robot
+let reacquire=10    // ticks to look again where a lost target was
 type Starter() =
     inherit Robot()
     let mutable free=false
     let mutable dodges=0      // dodges taken
     let mutable dodgeEnd=0    // the tick the current one ends
+    let mutable slot=0        // the last target's slot, for looking again where it was lost
     member this.Steer(towards,current)=this.Angles.Clamp(this.Angles.AngleDiff(towards,current)/45.0)
     override this.OnStart()=free <- this.Match.Is3d && this.Arena.Gravity.Z=0.0
+    // A straight line through the narrowest of the last `window` ticks' sightings: where the
+    // robot is now and how fast it moves. Each sighting is off by its BearingError; the line averages that out.
+    member this.Fit(slot:int,tick:int)=
+        let recent=this.Tracker.History(slot)|>Seq.filter(fun s->s.Tick>tick-window)|>List.ofSeq
+        if recent.Length<2 then None else
+        let best=recent|>List.map(fun s->s.BearingError)|>List.min
+        let seen=recent|>List.filter(fun s->s.BearingError<=1.5*best) // the narrow ones
+        let count=seen.Length
+        if count<2 then None else
+        let t0=(seen|>List.sumBy(fun s->float s.Tick))/float count
+        let spread=seen|>List.sumBy(fun s->(float s.Tick-t0)**2.0)
+        // One axis: the line's position now and its slope per tick.
+        let axis(of':Vec3->double)=
+            let mean=(seen|>List.sumBy(fun s->of' s.Position))/float count
+            let slope=(seen|>List.sumBy(fun s->(float s.Tick-t0)*(of' s.Position-mean)))/spread
+            mean+slope*(float tick-t0),slope*float this.Match.TickRate
+        let x,y,z=axis(fun p->p.X),axis(fun p->p.Y),axis(fun p->p.Z)
+        Some(Vec3(fst x,fst y,fst z),Vec3(snd x,snd y,snd z),count)
     override this.OnTurn()=
         let self=this.Me
         let position=self.Position
         let gun,scanner=this.Gun,this.Scanner
+        let tick=this.Clock.Tick
         this.Drive.Forces(brake=n 0.2)
         let target,cue=this.Sensors.Nearest,this.Tracker.Cue
+        let lastSeen=if slot<>0 then this.Tracker.LastSeen(slot) else Nullable()
         if not(isNull target) then
+            slot <- target.Slot
             let throttle=if target.Range>350.0 then 0.7 elif target.Range<200.0 then -0.4 else 0.2
             this.Drive.Set(n throttle,n(this.Steer(target.Bearing,self.Heading)),n(this.Steer(target.Elevation,self.Pitch)))
-            scanner.Set(n target.Bearing,n 20.0,n target.Elevation)
-            // gun.Lead is the intercept if the target holds course.
+            // Halve the beam each tick until it is holdWidth across at the target:
+            // narrow enough for a precise bearing, wide enough to keep it in.
+            let hold=max minArc (2.0*Math.Atan2(holdWidth/2.0,target.Range)*180.0/Math.PI)
+            // In a crowd a narrow beam sees one robot. Every lookEvery ticks,
+            // widen it for a tick: a nearer robot it finds becomes the target.
+            let arc=if tick%lookEvery=0 then searchArc else max hold (min searchArc (scanner.Last.Arc/2.0))
+            scanner.Set(n target.Bearing,n arc,n target.Elevation)
             let power=gun.PowerForFlightTime(target.Range,1.0)
-            let aim=gun.Lead(target,power)
+            // An exact contact: gun.Lead is the intercept if the target holds course.
+            // A noisy one: lead the fitted line, and fire only once it rests on enough sightings.
+            let aim,ready=
+                if target.BearingError>0.0 then
+                    match this.Fit(target.Slot,tick) with
+                    | Some(position,velocity,count)->gun.LeadPoint(position,velocity,power),count>=sightings
+                    | None->Unchecked.defaultof<Solution>,false
+                else gun.Lead(target,power),true
             let heading,pitch=if isNull aim then target.Bearing,target.Elevation else aim.Heading,aim.Pitch
             gun.Aim(n heading,n pitch)
             let now=gun.AimNow
-            if abs(this.Angles.AngleDiff(heading,now.Heading))<3.0 && abs(pitch-now.Pitch)<3.0 && gun.CanFire(power,10.0) then gun.Fire(n power)
-            this.Status.Set("TRACK",n target.Range)
+            if ready && abs(this.Angles.AngleDiff(heading,now.Heading))<3.0 && abs(pitch-now.Pitch)<3.0 && gun.CanFire(power,10.0) then gun.Fire(n power)
+            this.Status.Set((if ready then "TRACK" else "NARROW"),n target.Range)
+        elif lastSeen.HasValue && tick-lastSeen.Value<=reacquire then
+            // Lost it: look again where it was last seen, widening the beam, before searching.
+            let where=match this.Tracker.Position(slot) with null->position | seen->seen
+            let bearing=this.Angles.BearingTo(position,where)
+            let elevation=if free then this.Angles.ElevationTo(position,where) else 0.0
+            this.Drive.Set(n 0.5,n(this.Steer(bearing,self.Heading)),n(this.Steer(elevation,self.Pitch)))
+            scanner.Set(n bearing,n(min searchArc (scanner.Last.Arc*2.0)),n elevation)
+            this.Status.Set("REACQUIRE")
         elif not(isNull cue) then
             let bearing,distance=this.Angles.BearingTo(position,cue.Position),this.Angles.Distance(position,cue.Position)
             let elevation=if free then this.Angles.ElevationTo(position,cue.Position) else 0.0
-            let error,tick=min cue.BearingError 30.0,this.Clock.Tick
+            let error=min cue.BearingError 30.0
             let across=float(tick%5-2)/2.0*error
             let up=if free then float((tick/5)%3-1)*error/2.0 else 0.0
             this.Drive.Set(n 0.7,n(this.Steer(bearing,self.Heading)),n(this.Steer(elevation,self.Pitch)))
@@ -82,11 +136,10 @@ type Starter() =
             this.Status.Set("CUE",n distance)
         else
             this.Drive.Set(n 0.5,n 0.33,n(this.Steer(0.0,self.Pitch)))
-            let pitch=if free then float((this.Clock.Tick/10)%3-1)*35.0 else 0.0
-            scanner.Set(n(this.Angles.Normalize(scanner.Last.Heading+36.0)),n 40.0,n pitch)
+            let pitch=if free then float((tick/10)%3-1)*35.0 else 0.0
+            scanner.Set(n(this.Angles.Normalize(scanner.Last.Heading+36.0)),n searchArc,n pitch)
             this.Status.Set("SEARCH")
         // A simple dodge: vary it, or predict the shooter.
-        let tick=this.Clock.Tick
         if tick>=dodgeEnd && this.Sensors.Cues |> Seq.exists(fun c->c.Source=Source.Muzzle) then
             dodges <- dodges+1
             dodgeEnd <- tick+10
