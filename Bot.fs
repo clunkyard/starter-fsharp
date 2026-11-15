@@ -6,7 +6,8 @@
 // clock: tick seconds remaining_ticks
 // arena: size gravity terrain_kind ground_height(x y)
 // me: health position velocity heading pitch roll angular_velocity
-//   attitude grounded altitude applied
+//   attitude grounded altitude applied hull_mounts to_mount(heading pitch)
+//   from_mount(heading pitch) mount_toward(point)
 // battery: charge capacity regen sustainable_drive compute
 //   drive_cost(fraction)
 // drive: hover_lift
@@ -28,7 +29,8 @@
 // score: me best armour
 // angles: normalize(degrees) angle_diff(target current)
 //   bearing_to(from to) elevation_to(from to) direction(heading pitch)
-//   distance(a b) clamp(value low high)
+//   distance(a b) to_chassis(heading pitch attitude)
+//   from_chassis(heading pitch attitude) clamp(value low high)
 // raw: number(path) text(path) has(path) flag(path) count(path) line()
 // Controls: drive.set(throttle turn pitch_turn)
 //   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
@@ -47,6 +49,8 @@ let n (value:double)=Nullable value
 type Starter() =
     inherit Robot()
     let mutable free=false
+    let mutable dodges=0      // dodges taken
+    let mutable dodgeEnd=0    // the tick the current one ends
     member this.Steer(towards,current)=this.Angles.Clamp(this.Angles.AngleDiff(towards,current)/45.0)
     override this.OnStart()=free <- this.Match.Is3d && this.Arena.Gravity.Z=0.0
     override this.OnTurn()=
@@ -59,6 +63,7 @@ type Starter() =
             let throttle=if target.Range>350.0 then 0.7 elif target.Range<200.0 then -0.4 else 0.2
             this.Drive.Set(n throttle,n(this.Steer(target.Bearing,self.Heading)),n(this.Steer(target.Elevation,self.Pitch)))
             scanner.Set(n target.Bearing,n 20.0,n target.Elevation)
+            // gun.Lead is the intercept if the target holds course.
             let power=gun.PowerForFlightTime(target.Range,1.0)
             let aim=gun.Lead(target,power)
             let heading,pitch=if isNull aim then target.Bearing,target.Elevation else aim.Heading,aim.Pitch
@@ -80,6 +85,19 @@ type Starter() =
             let pitch=if free then float((this.Clock.Tick/10)%3-1)*35.0 else 0.0
             scanner.Set(n(this.Angles.Normalize(scanner.Last.Heading+36.0)),n 40.0,n pitch)
             this.Status.Set("SEARCH")
+        // A simple dodge: vary it, or predict the shooter.
+        let tick=this.Clock.Tick
+        if tick>=dodgeEnd && this.Sensors.Cues |> Seq.exists(fun c->c.Source=Source.Muzzle) then
+            dodges <- dodges+1
+            dodgeEnd <- tick+10
+        if tick<dodgeEnd then
+            // Off the line of fire: left, then right next time (turn is positive left, strafe positive right).
+            let left=dodges%2=1
+            if this.Match.Control=Control.Forces then
+                this.Drive.Set(throttle=n 0.5)
+                this.Drive.Forces(strafe=n(if left then -1.0 else 1.0))
+            else this.Drive.Set(n 1.0,n(if left then 1.0 else -1.0))
+            this.Status.Set((if left then "dodge:left" else "dodge:right"),n(float dodges))
         if this.Battery.Charge<this.Battery.Capacity/4.0 then this.Drive.Set(throttle=n(this.Drive.Get("throttle").GetValueOrDefault(0.0)*0.5))
         let storm,zone=this.Nav.Storm,this.Nav.Zone
         if not(isNull storm) && storm.Margin(position).GetValueOrDefault(-1e9)> -60.0 then
